@@ -132,6 +132,40 @@ def test_hf_spaces_model_list_uses_dynamic_free_model_cache(gradio_app_module, m
     mock_get.assert_not_called()
 
 
+def test_local_model_list_comes_from_configured_provider(gradio_app_module, monkeypatch):
+    monkeypatch.delenv("SPACE_ID", raising=False)
+    monkeypatch.setitem(gradio_app_module.config, "lmstudio_base_url", "http://localhost:1234/v1/")
+    response = gradio_app_module.requests.Response()
+    response.status_code = 200
+    response._content = (
+        b'{"data": [{"id": "local/model-b"}, {"id": "local/model-a"}, {"id": "local/model-b"}]}'
+    )
+
+    with patch.object(gradio_app_module.requests, "get", return_value=response) as mock_get:
+        models = gradio_app_module.fetch_available_models()
+
+    assert models == ["local/model-a", "local/model-b"]
+    mock_get.assert_called_once_with("http://localhost:1234/v1/models", timeout=10)
+
+
+def test_advanced_settings_exposes_available_model_choices(gradio_app_module):
+    models = [gradio_app_module.CONFIGURED_LLM_MODEL, "local/alternative-model"]
+
+    with patch.object(gradio_app_module, "fetch_available_models", return_value=models):
+        gradio_app_module.available_models = models
+        demo = gradio_app_module.create_gradio_interface()
+
+    model_dropdowns = [
+        component
+        for component in demo.config["components"]
+        if component["type"] == "dropdown" and str(component["props"].get("label", "")).startswith("LLM Model")
+    ]
+
+    assert len(model_dropdowns) == 1
+    assert "local/alternative-model" in str(model_dropdowns[0]["props"]["choices"])
+    assert model_dropdowns[0]["props"]["interactive"] is True
+
+
 def test_run_cycle_with_progress_streams_active_status(gradio_app_module, monkeypatch, tmp_path):
     from app.models import ContextMemory, ResearchGoal
     from app.run_store import RUNS_DIR_ENV

@@ -6,9 +6,13 @@ import re
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
+from urllib import response
+from xmlrpc import client
 
 import numpy as np
 import requests
+# from openai import OpenAI
+# from ollama import Client as Ollama
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -305,57 +309,110 @@ def _attempt_model(
     return f"Error: {last_error_message}"
 
 
+# def call_llm(
+#     prompt: str,
+#     temperature: float = 0.7,
+#     model: Optional[str] = None,
+#     fallback_models: Optional[List[str]] = None,
+# ) -> str:
+#     """Calls an LLM via OpenRouter, returning the response text.
+
+#     Tries the primary model (``model`` or ``config['llm_model']``) and, if it is
+#     unavailable, rate-limited, or too slow, automatically falls back to working
+#     free models (issue llnl#26/#32) so a single bad model does not fail every
+#     run. Auth/parse/final provider errors still propagate to the caller.
+#     """
+
 def call_llm(
-    prompt: str,
-    temperature: float = 0.7,
-    model: Optional[str] = None,
-    fallback_models: Optional[List[str]] = None,
-) -> str:
-    """Calls an LLM via OpenRouter, returning the response text.
+      prompt: str,
+      temperature: float = 0.7,
+      model: Optional[str] = None,
+      fallback_models: Optional[List[str]] = None,
+  ) -> str:
+      try:
+        client = OpenAI(
+              base_url=config.get(
+                  "lmstudio_base_url",
+                  "http://100.117.90.5",
+              ),
+              api_key=os.getenv("LMSTUDIO_API_KEY") or "lm-studio",
+              max_retries=0,
+              timeout=config.get("llm_request_timeout_seconds", 180),
+          )
 
-    Tries the primary model (``model`` or ``config['llm_model']``) and, if it is
-    unavailable, rate-limited, or too slow, automatically falls back to working
-    free models (issue llnl#26/#32) so a single bad model does not fail every
-    run. Auth/parse/final provider errors still propagate to the caller.
-    """
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
-        # openai>=1 raises from the OpenAI() constructor on a missing key, so
-        # check before constructing the client.
-        logger.error("OPENROUTER_API_KEY environment variable not set.")
-        return "Error: OpenRouter API key not set."
+        response = client.chat.completions.create(
+              model=model or config.get("llm_model"),
+              messages=[{"role": "user", "content": prompt}],
+              temperature=temperature,
+          )
 
-    # max_retries=0 disables the OpenAI SDK's own Retry-After backoff (which can
-    # block ~30s on a rate-limited free model); call_llm controls retries itself.
-    client = OpenAI(
-        base_url=config.get("openrouter_base_url"),
-        api_key=api_key,
-        max_retries=0,
-        timeout=config.get("llm_request_timeout_seconds", 30),
-    )
-    primary = model or config.get("llm_model")
-    if not primary:
-        logger.error("LLM model not configured in config.yaml")
-        return "Error: LLM model not configured."
+        return response.choices[0].message.content
 
-    # Happy path: try the primary model. No fallback fetch unless it's needed.
-    result = _attempt_model(client, primary, prompt, temperature)
-    if not _recoverable_with_another_model(result):
-        return result  # success, or a terminal error (auth) we must not mask
+      except Exception as e:
+            error = redact_secrets(str(e))
+            logger.error("LM Studio call failed: %s", error)
+            return f"Error: LM Studio call failed: {error}"
 
-    # Primary failed with something another model might fix (unavailable, rate
-    # limited, provider error): try working free models — the live OpenRouter
-    # list (fetched now) unless the caller passed an explicit list. Quick probes
-    # (max_retries=1) so we move past a flaky model to the next one fast.
-    logger.warning("Primary model '%s' failed (%s); trying other free models.", primary, result[:60])
-    fallbacks = fallback_models if fallback_models is not None else get_fallback_models(primary)
-    for candidate in _model_candidates(primary, fallbacks)[1 : 1 + MAX_FALLBACK_ATTEMPTS]:
-        logger.warning("Trying fallback model '%s'.", candidate)
-        result = _attempt_model(client, candidate, prompt, temperature, max_retries=1)
-        if not _recoverable_with_another_model(result):
-            return result
-    # Every candidate failed — surface the last error.
-    return result
+    #   try:
+    #       client = Ollama(
+    #           host=config.get("ollama_base_url", "http://localhost:11434")
+    #       )
+
+    #       response = client.chat(
+    #           model=model or config.get("llm_model"),
+    #           messages=[{"role": "user", "content": prompt}],
+    #           options={"temperature": temperature},
+    #       )
+
+    #       return response.message.content
+
+    #   except Exception as e:
+    #       error = redact_secrets(str(e))
+    #       logger.error("Ollama call failed: %s", error)
+    #       return f"Error: Ollama call failed: {error}"
+
+
+
+
+    # api_key = os.getenv("OPENROUTER_API_KEY")
+    # api_key = os.getenv("OLLAMA_API_KEY")
+    # if not api_key:
+    #     # openai>=1 raises from the OpenAI() constructor on a missing key, so
+    #     # check before constructing the client.
+    #     logger.error("OLLAMA_API_KEY environment variable not set.")
+    #     return "Error: Ollama API key not set."
+
+    # # max_retries=0 disables the OpenAI SDK's own Retry-After backoff (which can
+    # # block ~30s on a rate-limited free model); call_llm controls retries itself.
+    # client = Ollama(
+    #     base_url=config.get("_base_url","http://localhost:11434"),
+    #     api_key=api_key,
+    #     max_retries=0,
+    #     timeout=config.get("llm_request_timeout_seconds", 30),
+    # )
+    # primary = model or config.get("llm_model")
+    # if not primary:
+    #     logger.error("LLM model not configured in config.yaml")
+    #     return "Error: LLM model not configured."
+
+    # # Happy path: try the primary model. No fallback fetch unless it's needed.
+    # result = _attempt_model(client, primary, prompt, temperature)
+    # if not _recoverable_with_another_model(result):
+    #     return result  # success, or a terminal error (auth) we must not mask
+
+    # # Primary failed with something another model might fix (unavailable, rate
+    # # limited, provider error): try working free models — the live OpenRouter
+    # # list (fetched now) unless the caller passed an explicit list. Quick probes
+    # # (max_retries=1) so we move past a flaky model to the next one fast.
+    # logger.warning("Primary model '%s' failed (%s); trying other free models.", primary, result[:60])
+    # fallbacks = fallback_models if fallback_models is not None else get_fallback_models(primary)
+    # for candidate in _model_candidates(primary, fallbacks)[1 : 1 + MAX_FALLBACK_ATTEMPTS]:
+    #     logger.warning("Trying fallback model '%s'.", candidate)
+    #     result = _attempt_model(client, candidate, prompt, temperature, max_retries=1)
+    #     if not _recoverable_with_another_model(result):
+    #         return result
+    # # Every candidate failed — surface the last error.
+    # return result
 
 
 # --- Environment Detection ---

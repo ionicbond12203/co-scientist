@@ -31,7 +31,7 @@ current_research_goal: Optional[ResearchGoal] = None
 available_models: List[str] = []
 CONFIGURED_LLM_MODEL = config.get("llm_model", "")
 SAFE_FALLBACK_LLM_MODEL = CONFIGURED_LLM_MODEL or "-- Select Model --"
-CYCLE_TIMEOUT_SECONDS = int(os.getenv("CO_SCIENTIST_CYCLE_TIMEOUT_SECONDS", "300"))
+CYCLE_TIMEOUT_SECONDS = int(os.getenv("CO_SCIENTIST_CYCLE_TIMEOUT_SECONDS", "900"))
 CYCLE_PROGRESS_INTERVAL_SECONDS = 5
 
 # Configure logging for Gradio
@@ -39,7 +39,7 @@ logging.basicConfig(level=logging.INFO)
 
 
 def fetch_available_models():
-    """Fetch available models from OpenRouter with environment-based filtering."""
+    """Fetch selectable models from the configured provider."""
     global available_models
 
     # Detect deployment environment
@@ -56,21 +56,31 @@ def fetch_available_models():
             available_models = fetch_free_models() or ([CONFIGURED_LLM_MODEL] if CONFIGURED_LLM_MODEL else [])
             logger.info(f"Hugging Face Spaces: Filtered to {len(available_models)} free models")
         else:
-            response = requests.get("https://openrouter.ai/api/v1/models", timeout=10)
+            api_base_url = config.get("lmstudio_base_url") or config.get(
+                "openrouter_base_url", "https://openrouter.ai/api/v1"
+            )
+            models_url = f"{api_base_url.rstrip('/')}/models"
+            response = requests.get(models_url, timeout=10)
             response.raise_for_status()
             models_data = response.json().get("data", [])
 
-            # Extract all model IDs
-            all_models = sorted([model.get("id") for model in models_data if model.get("id")])
+            # OpenRouter and local OpenAI-compatible servers such as LM Studio
+            # expose the same ``{"data": [{"id": ...}]}`` model-list shape.
+            all_models = sorted({model.get("id") for model in models_data if model.get("id")})
+            if not all_models:
+                raise ValueError("The configured provider returned no models")
 
             # Use all models in local/development environment
             available_models = all_models
             logger.info(f"Local/Development: Using all {len(available_models)} models")
 
     except Exception as e:
-        logger.error(f"Failed to fetch models from OpenRouter: {e}")
-        cached_free_models = fetch_free_models()
-        available_models = cached_free_models or ([SAFE_FALLBACK_LLM_MODEL] if SAFE_FALLBACK_LLM_MODEL else [])
+        logger.error(f"Failed to fetch models from configured provider: {e}")
+        if config.get("lmstudio_base_url"):
+            available_models = [SAFE_FALLBACK_LLM_MODEL] if SAFE_FALLBACK_LLM_MODEL else []
+        else:
+            cached_free_models = fetch_free_models()
+            available_models = cached_free_models or ([SAFE_FALLBACK_LLM_MODEL] if SAFE_FALLBACK_LLM_MODEL else [])
 
     return available_models
 
@@ -741,11 +751,19 @@ def create_gradio_interface():
                 # Advanced settings
                 with gr.Accordion("⚙️ Advanced Settings", open=False):
                     default_model = get_default_model_choice()
+                    # model_dropdown = gr.Dropdown(
+                    #     choices=get_model_dropdown_choices(),
+                    #     value=default_model,
+                    #     label=f"LLM Model (default: {default_model})",
+                    #     info="Compact free models are recommended first so demo runs finish faster.",
+                    # )
+
                     model_dropdown = gr.Dropdown(
                         choices=get_model_dropdown_choices(),
                         value=default_model,
                         label=f"LLM Model (default: {default_model})",
-                        info="Compact free models are recommended first so demo runs finish faster.",
+                        info="Select any model currently available from the configured provider.",
+                        interactive=True,
                     )
 
                     with gr.Row():
@@ -931,8 +949,8 @@ def create_gradio_interface():
 
 if __name__ == "__main__":
     # Check for API key
-    if not os.getenv("OPENROUTER_API_KEY"):
-        print("⚠️  Warning: OPENROUTER_API_KEY environment variable not set.")
+    if not os.getenv("OLLAMA_API_KEY"):
+        print("⚠️  Warning: OLLAMA_API_KEY environment variable not set.")
         print("The app will start but may not function properly without an API key.")
 
     # Create and launch the Gradio app
