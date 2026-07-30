@@ -36,7 +36,7 @@ def call_llm_for_generation(
     response = call_llm(full_prompt, temperature=temperature, model=model)
     logger.info("LLM generation response: %s", response)
 
-    if response.startswith("Error:") or response.startswith("Authentication with OpenRouter failed"):
+    if response.startswith("Error:"):
         logger.error(f"LLM generation call failed: {response}")
         return [{"title": "Error", "text": response}]
 

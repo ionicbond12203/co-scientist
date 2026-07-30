@@ -35,13 +35,6 @@ jobs:
       - name: Offline test suite
         run: make test
 
-      # LLNL internal networks may block OpenRouter; run this no-key live
-      # catalog check from GitHub-hosted runners instead of local make test.
-      - name: OpenRouter free-model discovery smoke
-        env:
-          OPENROUTER_API_KEY: ""
-        run: pytest -o addopts="" -m network tests/test_openrouter_live.py
-
       - name: Boot smoke
         run: |
           python -c "import app; print('app package imports OK')"
@@ -51,7 +44,7 @@ jobs:
           spec = importlib.util.spec_from_file_location("gradio_app", "app.py")
           m = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(m)
-          with patch.object(m.requests, "get", side_effect=RuntimeError("offline CI")):
+          with patch.object(m, "fetch_lmstudio_models", return_value=[]):
               demo = m.create_gradio_interface()
           assert demo is not None
           print("Gradio interface constructs OK")
