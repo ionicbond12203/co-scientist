@@ -1,6 +1,8 @@
 import json
 from unittest.mock import Mock, patch
 
+import pytest
+
 from app.agents import (
     EvidenceCoverage,
     GenerationAgent,
@@ -19,6 +21,13 @@ from app.rag_retriever import (
     SearchQueryPlan,
     reciprocal_rank_fusion,
 )
+
+
+@pytest.fixture(autouse=True)
+def _disable_live_original_goal_search_for_generation_agent(monkeypatch):
+    """Keep generation tests offline; source-stage behavior is tested separately."""
+
+    monkeypatch.setattr(GenerationAgent, "_retrieve_original_scientific_sources", lambda *_: [])
 
 
 def _paper(
@@ -135,6 +144,29 @@ def test_query_rewriting_uses_selected_model_and_zero_temperature():
     normalized_planner_prompt = " ".join(planner_prompt.split())
     assert "goal_quote copied verbatim" in normalized_planner_prompt
     assert "must never become evidence gates" in normalized_planner_prompt
+
+
+def test_query_rewriting_allows_no_required_entity_terms():
+    payload = json.dumps(
+        {
+            "queries": ["one", "two", "three", "four", "five"],
+            "required_terms": [],
+            "explicit_requirements": [
+                {
+                    "id": "goal_scope",
+                    "goal_quote": "scientific creativity",
+                }
+            ],
+            "exploration_directions": [],
+        }
+    )
+
+    with patch("app.agents.call_llm", return_value=payload):
+        plan, error = call_llm_for_search_queries("Improve scientific creativity")
+
+    assert error is None
+    assert plan is not None
+    assert plan.required_terms == ()
 
 
 def test_query_rewriting_rejects_invalid_or_incomplete_json():
@@ -259,7 +291,7 @@ def test_query_rewriting_retries_a_composite_requirement_as_atomic_quotes():
     assert "Atomize long or composite goal quotes" in second_prompt
 
 
-def test_query_rewriting_failure_stops_before_retrieval():
+def test_query_rewriting_failure_stops_when_original_retrieval_is_empty():
     agent = GenerationAgent(
         minimum_relevant_sources=1,
         debate_rounds=0,
@@ -282,6 +314,70 @@ def test_query_rewriting_failure_stops_before_retrieval():
     assert hypotheses == []
     assert errors == ["Query rewriting failed: Error: LM Studio unavailable"]
     mock_retrieve.assert_not_called()
+
+
+def test_query_rewriting_failure_uses_original_candidates():
+    agent = GenerationAgent(
+        minimum_relevant_sources=1,
+        debate_rounds=0,
+    )
+    document = Mock()
+    document.page_content = "Source ID: arXiv:1234.5678\nAbstract: relevant evidence"
+    document.metadata = {
+        "source_id": "arXiv:1234.5678",
+        "arxiv_id": "1234.5678",
+        "title": "Relevant evidence",
+        "abstract": "Evidence for improving scientific creativity.",
+    }
+    generation_payload = json.dumps(
+        [
+            {
+                "title": "Fallback-grounded hypothesis",
+                "hypothesis": "A grounded relationship can be tested.",
+                "rationale": "The original evidence supports the premise.",
+                "feasibility": "Evaluate the relationship empirically.",
+                "source_ids": ["arXiv:1234.5678"],
+            }
+        ]
+    )
+
+    with (
+        patch.object(
+            GenerationAgent,
+            "_retrieve_original_scientific_sources",
+            return_value=[document],
+        ),
+        patch.object(agent.rag_retriever, "retrieve") as mock_retrieve,
+        patch(
+            "app.agents.call_llm",
+            side_effect=[
+                "Error: planner unavailable",
+                _relevance_payload("arXiv:1234.5678"),
+                _coverage_payload("arXiv:1234.5678"),
+                _synthesis_payload("arXiv:1234.5678"),
+                generation_payload,
+            ],
+        ) as mock_llm,
+    ):
+        hypotheses, errors = agent.generate_new_hypotheses(
+            ResearchGoal("Improve scientific creativity", num_hypotheses=1),
+            ContextMemory(),
+        )
+
+    assert errors == []
+    assert len(hypotheses) == 1
+    assert hypotheses[0].evidence_source_ids == ["arXiv:1234.5678"]
+    mock_retrieve.assert_not_called()
+    coverage_prompt = mock_llm.call_args_list[2].args[0]
+    assert "goal_scope: Improve scientific creativity" in coverage_prompt
+
+
+def test_rag_defaults_keep_more_candidate_evidence():
+    retriever = ArxivRAGRetriever()
+
+    assert retriever.results_per_query == 10
+    assert retriever.top_k == 10
+    assert retriever.max_abstract_chars == 4000
 
 
 def test_relevance_grader_keeps_only_known_directly_relevant_sources():
@@ -479,6 +575,8 @@ def test_multi_query_retrieval_filters_irrelevant_history_papers():
         top_k=4,
     )
     retriever.arxiv = Mock()
+    retriever.semantic_scholar = None
+    retriever.springer = None
     retriever.arxiv.search_papers.side_effect = [
         [malaysia, context_history],
         [duplicate, quantum_history],
@@ -518,6 +616,8 @@ def test_multi_query_retrieval_filters_irrelevant_history_papers():
 def test_retrieval_returns_empty_when_strict_filter_removes_every_paper():
     retriever = ArxivRAGRetriever(query_count=5)
     retriever.arxiv = Mock()
+    retriever.semantic_scholar = None
+    retriever.springer = None
     retriever.arxiv.search_papers.return_value = [
         _paper(
             "2103.05280v1",
@@ -552,6 +652,8 @@ def test_targeted_corrective_retrieval_can_skip_initial_entity_filter():
         top_k=2,
     )
     retriever.arxiv = Mock()
+    retriever.semantic_scholar = None
+    retriever.springer = None
     retriever.arxiv.search_papers.return_value = [comparator_paper]
     query_plan = SearchQueryPlan(
         queries=("Grad-CAM medical image classification",),
@@ -574,6 +676,70 @@ def test_targeted_corrective_retrieval_can_skip_initial_entity_filter():
 
     assert len(documents) == 1
     assert documents[0].metadata["source_id"] == ("arXiv:2401.00001v1")
+
+
+def test_retrieval_tries_original_goal_in_semantic_scholar_before_rewritten_queries():
+    direct_paper = _paper(
+        "s2:direct-paper",
+        "Direct goal result",
+        "Evidence about lightweight security monitoring at 5G MEC sites.",
+    )
+    retriever = ArxivRAGRetriever(query_count=2, top_k=1)
+    retriever.semantic_scholar = Mock()
+    retriever.semantic_scholar.search_papers.return_value = [direct_paper]
+    retriever.springer = None
+    retriever.arxiv = Mock()
+    retriever.arxiv.search_papers.return_value = []
+    fake_store = Mock()
+    fake_store.similarity_search.side_effect = lambda *args, **kwargs: fake_store.add_documents.call_args.kwargs[
+        "documents"
+    ]
+
+    with patch("app.rag_retriever.InMemoryVectorStore", return_value=fake_store):
+        documents = retriever.retrieve_original_goal("lightweight security monitoring 5G MEC")
+
+    retriever.semantic_scholar.search_papers.assert_called_once_with(query="lightweight security monitoring 5G MEC")
+    retriever.arxiv.search_papers.assert_called_once()
+    assert documents[0].metadata["source_id"] == "s2:direct-paper"
+
+
+def test_retrieval_stops_arxiv_batch_after_rate_limit():
+    retriever = ArxivRAGRetriever(query_count=3, top_k=1)
+    retriever.semantic_scholar = Mock()
+    retriever.semantic_scholar.search_papers.side_effect = [[], [], [], []]
+    retriever.springer = None
+    retriever.arxiv = Mock()
+    retriever.arxiv.search_papers.return_value = []
+    retriever.arxiv.last_error_status = 429
+    query_plan = SearchQueryPlan(
+        queries=("rewritten one", "rewritten two", "rewritten three"),
+        required_terms=(),
+    )
+
+    with patch("app.rag_retriever.InMemoryVectorStore"):
+        retriever.retrieve("original goal", query_plan)
+
+    assert retriever.arxiv.search_papers.call_count == 1
+
+
+def test_retrieval_stops_semantic_scholar_batch_after_rate_limit():
+    retriever = ArxivRAGRetriever(query_count=3, top_k=1)
+    retriever.semantic_scholar = Mock()
+    retriever.semantic_scholar.search_papers.return_value = []
+    retriever.semantic_scholar.last_error_status = 429
+    retriever.springer = None
+    retriever.arxiv = Mock()
+    retriever.arxiv.search_papers.return_value = []
+    query_plan = SearchQueryPlan(
+        queries=("rewritten one", "rewritten two", "rewritten three"),
+        required_terms=(),
+    )
+
+    with patch("app.rag_retriever.InMemoryVectorStore"):
+        retriever.retrieve("original goal", query_plan)
+
+    # The remaining rewritten queries are skipped after the first rate-limit signal.
+    assert retriever.semantic_scholar.search_papers.call_count == 1
 
 
 def test_semantic_scholar_fallback_fuses_and_reranks_results():

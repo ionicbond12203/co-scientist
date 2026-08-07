@@ -9,6 +9,7 @@ from typing import Dict, List, Tuple
 from ..models import ContextMemory, Hypothesis, ResearchGoal
 from ..rag_retriever import (
     ArxivRAGRetriever,
+    EvidenceAspect,
     SearchQueryPlan,
     format_documents_for_prompt,
     serialize_documents,
@@ -44,6 +45,27 @@ class GenerationAgent:
         return self.rag_retriever.retrieve(
             rerank_query or research_goal.description,
             query_plan,
+        )
+
+    def _retrieve_original_scientific_sources(self, research_goal: ResearchGoal):
+        """Run the first retrieval stage with the user's unmodified goal."""
+
+        return self.rag_retriever.retrieve_original_goal(research_goal.description)
+
+    @staticmethod
+    def _build_minimal_fallback_plan(research_goal: str) -> SearchQueryPlan:
+        """Keep usable original evidence when LLM query planning fails."""
+
+        normalized_goal = research_goal.strip()
+        return SearchQueryPlan(
+            queries=(normalized_goal,),
+            required_terms=(),
+            explicit_requirements=(
+                EvidenceAspect(
+                    aspect_id="goal_scope",
+                    description=normalized_goal,
+                ),
+            ),
         )
 
     @staticmethod
@@ -150,16 +172,29 @@ Your refined contribution:
 
         num_to_generate = research_goal.num_hypotheses
         gen_temp = research_goal.generation_temperature
+        try:
+            candidate_documents = self._retrieve_original_scientific_sources(research_goal)
+        except Exception as exc:
+            _legacy.logger.error("Original-goal retrieval failed: %s", exc, exc_info=True)
+            candidate_documents = []
+
         query_plan, rewrite_error = _legacy.call_llm_for_search_queries(
             research_goal.description,
             model=research_goal.llm_model,
             query_count=self.rag_retriever.query_count,
         )
-        if rewrite_error or query_plan is None:
+        if (rewrite_error or query_plan is None) and not candidate_documents:
             context.last_retrieved_sources = []
             error = rewrite_error or "Query rewriting failed."
             _legacy.logger.error(error)
             return [], [error]
+        if rewrite_error or query_plan is None:
+            _legacy.logger.warning(
+                "%s Continuing with %d original-goal candidate(s) and a minimal fallback plan.",
+                rewrite_error or "Query rewriting failed.",
+                len(candidate_documents),
+            )
+            query_plan = self._build_minimal_fallback_plan(research_goal.description)
 
         _legacy.logger.info(
             "Query rewriting produced queries=%s required_terms=%s explicit_requirements=%s exploration_directions=%s",
@@ -169,18 +204,14 @@ Your refined contribution:
             query_plan.exploration_directions,
         )
 
-        try:
-            candidate_documents = self._retrieve_scientific_sources(
-                research_goal,
-                query_plan,
-            )
-        except Exception as exc:
-            _legacy.logger.error(
-                "RAG retrieval failed: %s",
-                exc,
-                exc_info=True,
-            )
-            return [], [f"RAG retrieval failed: {exc}"]
+        expanded_retrieval_attempted = False
+        if not candidate_documents:
+            try:
+                candidate_documents = self._retrieve_scientific_sources(research_goal, query_plan)
+                expanded_retrieval_attempted = True
+            except Exception as exc:
+                _legacy.logger.error("Expanded RAG retrieval failed: %s", exc, exc_info=True)
+                return [], [f"Expanded RAG retrieval failed: {exc}"]
 
         retrieved_documents = []
         coverage = None
@@ -227,6 +258,17 @@ Your refined contribution:
 
             if coverage.sufficient:
                 break
+
+            if not expanded_retrieval_attempted:
+                _legacy.logger.info("Original-goal retrieval was insufficient; starting expanded-query retrieval.")
+                try:
+                    expanded_documents = self._retrieve_scientific_sources(research_goal, query_plan)
+                except Exception as exc:
+                    _legacy.logger.error("Expanded RAG retrieval failed: %s", exc, exc_info=True)
+                    return [], [f"Expanded RAG retrieval failed: {exc}"]
+                expanded_retrieval_attempted = True
+                candidate_documents = self._merge_retrieved_documents(candidate_documents, expanded_documents)
+                continue
 
             if corrective_round >= (self.rag_retriever.corrective_retrieval_rounds):
                 if not fallback_attempted:

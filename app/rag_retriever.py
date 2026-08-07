@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -10,8 +11,10 @@ from langchain_core.vectorstores import InMemoryVectorStore
 
 from .config import config
 from .tools.arxiv_search import ArxivSearchTool
+from .tools.elsevier_search import ElsevierSearchTool
 from .tools.semantic_scholar_search import SemanticScholarSearchTool
 from .tools.springer_search import SpringerSearchTool
+from .tools.tavily_search import TavilySearchTool
 from .utils import get_sentence_transformer_model, logger
 
 
@@ -116,8 +119,8 @@ class ArxivRAGRetriever:
         rag_config = config.get("rag", {})
 
         self.query_count = query_count or int(rag_config.get("query_count", 5))
-        self.results_per_query = results_per_query or int(rag_config.get("results_per_query", 6))
-        self.top_k = top_k or int(rag_config.get("top_k", 4))
+        self.results_per_query = results_per_query or int(rag_config.get("results_per_query", 10))
+        self.top_k = top_k or int(rag_config.get("top_k", 10))
         self.minimum_relevant_sources = minimum_relevant_sources or int(rag_config.get("minimum_relevant_sources", 3))
         self.corrective_retrieval_rounds = (
             corrective_retrieval_rounds
@@ -131,7 +134,7 @@ class ArxivRAGRetriever:
         )
         self.top_k = max(self.top_k, self.minimum_relevant_sources)
         self.rrf_k = rrf_k or int(rag_config.get("rrf_k", 60))
-        self.max_abstract_chars = max_abstract_chars or int(rag_config.get("max_abstract_chars", 1800))
+        self.max_abstract_chars = max_abstract_chars or int(rag_config.get("max_abstract_chars", 4000))
 
         self.arxiv = ArxivSearchTool(max_results=self.results_per_query)
         semantic_scholar_config = config.get("semantic_scholar", {})
@@ -144,49 +147,106 @@ class ArxivRAGRetriever:
         springer_config = config.get("springer", {})
         springer_results = int(springer_config.get("results_per_query", self.results_per_query))
         self.springer = (
-            SpringerSearchTool(max_results=springer_results)
-            if springer_config.get("enabled", True)
-            else None
+            SpringerSearchTool(max_results=springer_results) if springer_config.get("enabled", True) else None
         )
+        elsevier_config = config.get("elsevier", {})
+        elsevier_results = int(elsevier_config.get("results_per_query", self.results_per_query))
+        self.elsevier = (
+            ElsevierSearchTool(max_results=elsevier_results) if elsevier_config.get("enabled", True) else None
+        )
+        tavily_config = config.get("tavily", {})
+        tavily_results = int(tavily_config.get("results_per_query", self.results_per_query))
+        self.tavily = TavilySearchTool(max_results=tavily_results) if tavily_config.get("enabled", True) else None
         self.embeddings = SharedSentenceTransformerEmbeddings()
 
-    def retrieve(
-        self,
-        original_query: str,
-        query_plan: SearchQueryPlan,
-    ) -> list[Document]:
-        """Retrieve, filter, fuse, and rerank arXiv abstracts."""
+    def _supplementary_sources(self):
+        return (
+            ("Semantic Scholar", self.semantic_scholar),
+            ("Springer Nature", self.springer if self.springer is not None and self.springer.is_configured else None),
+            ("Elsevier Scopus", self.elsevier if self.elsevier is not None and self.elsevier.is_configured else None),
+            ("Tavily", self.tavily if self.tavily is not None and self.tavily.is_configured else None),
+        )
+
+    def _supplementary_results(self, queries: Sequence[str]) -> list[list[dict[str, Any]]]:
+        """Search non-arXiv academic sources for the supplied queries."""
+
+        ranked_results: list[list[dict[str, Any]]] = []
+        for source_name, source in self._supplementary_sources():
+            if source is None:
+                continue
+            for query in queries:
+                ranked_results.append(source.search_papers(query=query))
+                if getattr(source, "last_error_status", None) in (429, 503):
+                    logger.warning(
+                        "%s returned HTTP %s; skipping its remaining queries in this retrieval round.",
+                        source_name,
+                        source.last_error_status,
+                    )
+                    break
+        return ranked_results
+
+    def retrieve_original_goal(self, original_query: str) -> list[Document]:
+        """Search the unmodified research goal across all configured sources concurrently."""
 
         original_query = original_query.strip()
         if not original_query:
             return []
 
-        ranked_results = [
-            self.arxiv.search_papers(
-                query=query,
-                max_results=self.results_per_query,
-                sort_by="relevance",
-            )
-            for query in query_plan.queries
-        ]
-        fused_papers = reciprocal_rank_fusion(
-            ranked_results,
-            k=self.rrf_k,
+        tasks = [("arXiv", lambda: self._arxiv_results((original_query,)))]
+        tasks.extend(
+            (source_name, lambda source=source: [source.search_papers(query=original_query)])
+            for source_name, source in self._supplementary_sources()
+            if source is not None
         )
-        relevant_papers = [
-            paper
-            for paper in fused_papers
-            if self._contains_required_term(
-                paper,
-                query_plan.required_terms,
-            )
-        ]
+        with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+            futures = [(source_name, executor.submit(search)) for source_name, search in tasks]
+            ranked_results: list[list[dict[str, Any]]] = []
+            for source_name, future in futures:
+                try:
+                    ranked_results.extend(future.result())
+                except Exception as exc:
+                    logger.error("%s original-goal search failed: %s", source_name, exc)
 
-        if not relevant_papers:
-            logger.warning(
-                "RAG retrieval found no papers containing required terms %s.",
-                query_plan.required_terms,
+        return self._rank_documents(
+            original_query,
+            SearchQueryPlan(queries=(), required_terms=()),
+            ranked_results,
+        )
+
+    def _arxiv_results(self, queries: Sequence[str]) -> list[list[dict[str, Any]]]:
+        """Search arXiv, stopping the batch when the service rate-limits us."""
+
+        ranked_results: list[list[dict[str, Any]]] = []
+        for query in queries:
+            ranked_results.append(
+                self.arxiv.search_papers(
+                    query=query,
+                    max_results=self.results_per_query,
+                    sort_by="relevance",
+                )
             )
+            if getattr(self.arxiv, "last_error_status", None) in (429, 503):
+                logger.warning(
+                    "arXiv returned HTTP %s; skipping its remaining queries in this retrieval round.",
+                    self.arxiv.last_error_status,
+                )
+                break
+        return ranked_results
+
+    def _rank_documents(
+        self,
+        original_query: str,
+        query_plan: SearchQueryPlan,
+        ranked_results: Sequence[Sequence[dict[str, Any]]],
+    ) -> list[Document]:
+        """Fuse source results, enforce requested entities, and rerank."""
+
+        fused_papers = reciprocal_rank_fusion(ranked_results, k=self.rrf_k)
+        relevant_papers = [
+            paper for paper in fused_papers if self._contains_required_term(paper, query_plan.required_terms)
+        ]
+        if not relevant_papers:
+            logger.warning("RAG retrieval found no papers containing required terms %s.", query_plan.required_terms)
             return []
 
         documents = [
@@ -202,10 +262,7 @@ class ArxivRAGRetriever:
             documents=documents,
             ids=[str(document.metadata["source_id"]) for document in documents],
         )
-        selected = vector_store.similarity_search(
-            original_query,
-            k=min(self.top_k, len(documents)),
-        )
+        selected = vector_store.similarity_search(original_query, k=min(self.top_k, len(documents)))
         logger.info(
             "RAG selected %d sources from %d entity-matched candidates: %s",
             len(selected),
@@ -213,6 +270,21 @@ class ArxivRAGRetriever:
             [document.metadata.get("source_id") for document in selected],
         )
         return selected
+
+    def retrieve(
+        self,
+        original_query: str,
+        query_plan: SearchQueryPlan,
+    ) -> list[Document]:
+        """Retrieve expanded-query evidence from every configured source."""
+
+        original_query = original_query.strip()
+        if not original_query:
+            return []
+
+        ranked_results = self._supplementary_results(query_plan.queries)
+        ranked_results.extend(self._arxiv_results(query_plan.queries))
+        return self._rank_documents(original_query, query_plan, ranked_results)
 
     @staticmethod
     def _contains_required_term(
@@ -240,15 +312,7 @@ class ArxivRAGRetriever:
         if not original_query:
             return []
 
-        ranked_results: list[list[dict[str, Any]]] = []
-
-        if self.semantic_scholar is not None:
-            for query in query_plan.queries:
-                ranked_results.append(self.semantic_scholar.search_papers(query=query))
-
-        if self.springer is not None and self.springer.is_configured:
-            for query in query_plan.queries:
-                ranked_results.append(self.springer.search_papers(query=query))
+        ranked_results = self._supplementary_results(query_plan.queries)
 
         if not ranked_results:
             return []
@@ -287,7 +351,7 @@ class ArxivRAGRetriever:
         arxiv_id = str(paper["arxiv_id"])
         source_id = (
             arxiv_id
-            if any(arxiv_id.startswith(p) for p in ("s2:", "springer:", "tavily:", "doi:"))
+            if any(arxiv_id.startswith(p) for p in ("s2:", "springer:", "elsevier:", "tavily:", "doi:"))
             else f"arXiv:{arxiv_id}"
         )
 

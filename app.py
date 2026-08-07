@@ -5,15 +5,22 @@ import time
 from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
+
 import gradio as gr
-from numpy.ma import count
+from numpy.ma import count  # noqa: F401
 
 from app.agents import SupervisorAgent
-
-# Import the existing app components
 from app.config import config
 from app.models import ContextMemory, ResearchGoal
-from app.run_store import delete_run, get_reports_dir, history_html, list_runs, report_file_url, save_run, write_report
+from app.run_store import (
+    delete_run,
+    get_reports_dir,
+    history_html,
+    list_runs,
+    report_file_url,
+    save_run,
+    write_report,
+)
 from app.utils import (
     classify_llm_error,
     fetch_lmstudio_models,
@@ -148,6 +155,18 @@ def set_research_goal(
         return error_msg, ""
 
 
+def format_execution_time(seconds: float) -> str:
+    """Format execution time as X min Y sec."""
+
+    minutes = int(seconds // 60)
+    seconds = int(seconds % 60)
+
+    if minutes > 0:
+        return f"{minutes} mins {seconds} sec"
+
+    return f"{seconds} sec"
+
+
 def execute_cycle(
     research_goal: ResearchGoal,
     context: ContextMemory,
@@ -178,9 +197,12 @@ def execute_cycle(
 
         # Log execution time
         total_time = time.perf_counter() - start_time
-        cycle_details["execution_time"] = total_time
+        formatted_time = format_execution_time(total_time)
 
-        logger.info(f"Cycle execution time: {total_time:.2f} seconds")
+        cycle_details["execution_time"] = total_time
+        cycle_details["execution_time_formatted"] = formatted_time
+
+        logger.info(f"Cycle execution time: {formatted_time}")
 
         # Log all steps and hypotheses
         steps = cycle_details.get("steps", {})
@@ -205,16 +227,16 @@ def execute_cycle(
             categories = sorted({classify_llm_error(e) for e in errors})
             cause = "; ".join(categories)
             if produced_any:
-                status_msg = f"⚠️ Cycle {iteration} completed with errors ({cause}).\n\n{to_bold('Execution Time:')} {total_time:.2f} seconds.\n{to_bold('Log:')} {log_file}"
+                status_msg = f"⚠️ Cycle {iteration} completed with errors ({cause}).\n\n{to_bold('Execution Time:')} {formatted_time}.\n{to_bold('Log:')} {log_file}"
             else:
                 status_msg = (
-                    f"⚠️ Cycle {iteration} could not generate hypotheses — {cause}.\n\n{to_bold('Execution Time:')} {total_time:.2f} seconds.\n"
+                    f"⚠️ Cycle {iteration} could not generate hypotheses — {cause}.\n\n{to_bold('Execution Time:')} {formatted_time}.\n"
                     f"See the results panel for details. {to_bold('Log:')} {log_file}"
                 )
         else:
             status_msg = (
                 f"✅ Cycle {iteration} completed successfully!\n\n"
-                f"{to_bold('Execution Time:')} {total_time:.2f} seconds\n"
+                f"{to_bold('Execution Time:')} {formatted_time}\n"
                 f"{to_bold('Log:')} {log_file}"
             )
 
@@ -268,11 +290,11 @@ def run_cycle() -> Tuple[str, str, str]:
 
 def format_timeout_duration(timeout_seconds: float) -> str:
     if timeout_seconds < 60:
-        return f"{timeout_seconds:g} seconds"
+        return f"{timeout_seconds:.2f} sec"
     minutes = timeout_seconds / 60
     if minutes.is_integer():
-        return f"{int(minutes)} minutes"
-    return f"{minutes:.1f} minutes"
+        return f"{int(minutes)} mins"
+    return f"{minutes:.2f} mins"
 
 
 def timeout_results_html(timeout_seconds: float) -> str:
@@ -290,28 +312,36 @@ def format_evidence_sources_html(
     hypothesis: Dict,
     generation_sources: List[Dict],
 ) -> str:
-    """Render validated hypothesis source IDs as clickable arXiv links."""
+    """Render validated evidence as useful links to the original source."""
     import html as html_lib
 
-    available_source_ids = {
-        str(source.get("source_id") or f"arXiv:{source.get('arxiv_id')}")
-        for source in generation_sources
-        if source.get("source_id") or source.get("arxiv_id")
-    }
+    available_sources = {}
+    for source in generation_sources:
+        if not isinstance(source, dict):
+            continue
+        source_id = str(source.get("source_id") or f"arXiv:{source.get('arxiv_id')}")
+        if source_id:
+            available_sources[source_id] = source
     evidence_source_ids = hypothesis.get("evidence_source_ids", [])
     if not isinstance(evidence_source_ids, list):
         evidence_source_ids = []
 
     links = []
     for source_id in dict.fromkeys(evidence_source_ids):
-        if not isinstance(source_id, str) or source_id not in available_source_ids:
+        if not isinstance(source_id, str) or source_id not in available_sources:
             continue
-        arxiv_id = source_id.removeprefix("arXiv:")
-        href = f"https://arxiv.org/abs/{quote(arxiv_id, safe='/.-')}"
+        source = available_sources[source_id]
+        href = str(source.get("arxiv_url") or source.get("pdf_url") or "").strip()
+        if not href and source_id.startswith("arXiv:"):
+            arxiv_id = source_id.removeprefix("arXiv:")
+            href = f"https://arxiv.org/abs/{quote(arxiv_id, safe='/.-')}"
+        if not href.startswith(("https://", "http://")):
+            continue
+        label = str(source.get("title") or source_id)
         links.append(
             f'<a href="{html_lib.escape(href, quote=True)}" '
             'target="_blank" rel="noopener noreferrer">'
-            f"{html_lib.escape(source_id)}</a>"
+            f"{html_lib.escape(label)}</a>"
         )
 
     rendered_sources = ", ".join(links) if links else "None recorded"
@@ -443,7 +473,7 @@ def format_cycle_results(cycle_details: Dict, log_file: str = None) -> str:
             html += f"<p><strong>Generated {len(hypotheses)} new hypotheses:</strong></p>"
             for i, hypo in enumerate(hypotheses):
                 html += f"""
-                <div style="border-left: 3px solid #28a745; padding-left: 10px; margin: 10px 0;">
+                <div style="border-left: 3px solid #28a745; padding: 10px; margin: 10px 0; border-radius: 15px;">
                     <h5>#{i + 1}: {hypo.get("title", "Untitled")} (ID: {hypo.get("id", "Unknown")})</h5>
                     <p style="white-space: pre-line;">{hypo.get("text", "No description")}</p>
                     {format_evidence_sources_html(hypo, generation_sources)}
@@ -455,7 +485,7 @@ def format_cycle_results(cycle_details: Dict, log_file: str = None) -> str:
             html += f"<p><strong>Reviewed {len(hypotheses)} hypotheses:</strong></p>"
             for hypo in hypotheses:
                 html += f"""
-                <div style="border-left: 3px solid #17a2b8; padding-left: 10px; margin: 10px 0;">
+                <div style="border-left: 3px solid #17a2b8; padding: 10px; margin: 10px 0; border-radius: 15px;">
                     <h5>{hypo.get("title", "Untitled")} (ID: {hypo.get("id", "Unknown")})</h5>
                     <p><strong>Novelty:</strong> {hypo.get("novelty_review", "Not assessed")} | 
                        <strong>Feasibility:</strong> {hypo.get("feasibility_review", "Not assessed")}</p>
@@ -554,7 +584,7 @@ def format_cycle_results(cycle_details: Dict, log_file: str = None) -> str:
             html += f"<p><strong>Evolved {len(hypotheses)} new hypotheses by combining top performers:</strong></p>"
             for hypo in hypotheses:
                 html += f"""
-                <div style="border-left: 3px solid #ffc107; padding-left: 10px; margin: 10px 0;">
+                <div style="border-left: 3px solid #ffc107; padding: 10px; margin: 10px 0; border-radius: 15px;">
                     <h5>{hypo.get("title", "Untitled")} (ID: {hypo.get("id", "Unknown")})</h5>
                     <p>{hypo.get("text", "No description")}</p>
                     {format_evidence_sources_html(hypo, generation_sources)}
@@ -631,7 +661,7 @@ def format_cycle_results(cycle_details: Dict, log_file: str = None) -> str:
                 html += "<h5>Top Ranked Hypotheses:</h5>"
                 for i, hypo in enumerate(top_hypos):
                     html += f"""
-                    <div style="border-left: 3px solid #28a745; padding-left: 10px; margin: 10px 0;">
+                    <div style="border-left: 3px solid #28a745; padding: 10px; margin: 10px 0; border-radius: 15px;">
                         <h6>#{i + 1}: {hypo.get("title", "Untitled")}</h6>
                         <p><strong>ID:</strong> {hypo.get("id", "Unknown")} | 
                            <strong>Elo Score:</strong> {hypo.get("elo_score", 0):.2f}</p>
@@ -797,10 +827,9 @@ def create_gradio_interface():
     # Get deployment status
     status_text, status_color = get_deployment_status()
 
-    with gr.Blocks(
-        title="Open AI Co-Scientist - Hypothesis Evolution System",
-        theme=gr.themes.Soft(),
-        css="""
+    # Define custom theme and CSS for launch()
+    theme = gr.themes.Soft()
+    css = """
         .status-box {
             padding: 10px;
             border-radius: 8px;
@@ -830,8 +859,9 @@ def create_gradio_interface():
             background-color: #064e3b !important; /* Soft deep emerald instead of blinding light green */
             border-color: #28a745 !important;
         }
-        """,
-    ) as demo:
+        """
+
+    with gr.Blocks(title="Open AI Co-Scientist - Hypothesis Evolution System") as demo:
         # Header
         gr.Markdown("# 🔬 Open AI Co-Scientist - Hypothesis Evolution System")
         gr.Markdown("Generate, review, rank, and evolve research hypotheses using AI agents.")
@@ -1008,11 +1038,11 @@ def create_gradio_interface():
         # Example inputs
         gr.Examples(
             examples=[
-                ["Develop new methods for increasing the efficiency of solar panels"],
-                ["Create novel approaches to treat Alzheimer's disease"],
-                ["Design sustainable materials for construction"],
-                ["Improve machine learning model interpretability"],
-                ["Develop new quantum computing algorithms"],
+                ["Develop a closed-loop multi-agent AI framework to dynamically allocate 5G slice bandwidth during traffic spikes"],
+                ["Create a machine learning orchestrator that injects post-quantum cryptographic keys into active 5G network slices without increasing latency"],
+                ["Develop a real-time anomaly detector for Open-RAN architectures that spots and blocks malicious, rogue network apps"],
+                ["Improve 5G battery life by optimizing device wake-up sensors"],
+                ["Automate the root-cause diagnosis of 5G tower failures by deploying AI agents to read logs and execute patches"],
             ],
             inputs=[research_goal_input],
             label="Example Research Goals",
@@ -1038,6 +1068,9 @@ def create_gradio_interface():
             """
         )
 
+    demo.theme = theme
+    demo.css = css
+
     return demo
 
 
@@ -1054,4 +1087,6 @@ if __name__ == "__main__":
         share=False,
         show_error=True,
         allowed_paths=[str(reports_dir.resolve())],
+        theme=getattr(demo, "theme", None),
+        css=getattr(demo, "css", None),
     )
